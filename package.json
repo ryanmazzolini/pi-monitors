@@ -1,0 +1,48 @@
+{
+  "name": "@ryanmazzolini/pi-monitors",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Monitor asynchronous events in Pi with persistent notifications and a shared Monitors panel",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ryanmazzolini/pi-monitors.git"
+  },
+  "homepage": "https://github.com/ryanmazzolini/pi-monitors#readme",
+  "bugs": {
+    "url": "https://github.com/ryanmazzolini/pi-monitors/issues"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "files": [
+    "extensions",
+    "!extensions/**/*.test.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.extensions.json",
+    "test": "npm run typecheck && node --test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@earendil-works/pi-tui": "0.83.0",
+    "@types/node": "^24.0.0",
+    "typebox": "^1.1.38",
+    "typescript": "^5.9.3"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/pi-monitors/index.ts"
+    ]
+  }
+}
