@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createGithubPrMonitorAdapter } from "./adapters/github-pr.ts";
+import { loadConcourseConfig } from "./adapters/concourse-config.ts";
+import { createConcourseDeploymentMonitorAdapter } from "./adapters/concourse-deployment.ts";
 import { createPiMonitorsRuntime, type PiMonitorsRuntime } from "./runtime.ts";
 import {
 	MONITOR_ADAPTER_DISCOVERY_EVENT,
@@ -49,5 +51,16 @@ export function createPiMonitorsExtension(
 }
 
 export default function piMonitorsExtension(pi: ExtensionAPI): void {
-	createPiMonitorsExtension(pi, [createGithubPrMonitorAdapter()]);
+	const { config, warning } = loadConcourseConfig();
+	const adapters = [createGithubPrMonitorAdapter()];
+	if (config) adapters.push(createConcourseDeploymentMonitorAdapter(config));
+	if (warning) {
+		let warned = false;
+		pi.on("session_start", (_event, ctx) => {
+			if (warned) return;
+			warned = true;
+			ctx.ui.notify(warning, "warning");
+		});
+	}
+	createPiMonitorsExtension(pi, adapters);
 }

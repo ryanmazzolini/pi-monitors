@@ -992,3 +992,343 @@ test("persists completed records, restores them, and keeps dismissals branch-loc
   await third.handlers.get("session_start")({}, thirdCtx);
   assert.deepEqual(third.runtime.snapshot().recent, []);
 });
+
+async function configuredExtension(t, raw, prepare) {
+	const directory = await mkdtemp(join(tmpdir(), "pi-monitors-config-"));
+	const file = join(directory, "pi-monitors.json");
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	if (prepare) raw = await prepare(directory);
+	if (raw !== undefined) await writeFile(file, raw);
+	const { default: loadExtension } = await import("./index.ts");
+	const handlers = new Map();
+	const tools = [];
+	const renderers = new Map();
+	const notices = [];
+	const entries = [];
+	const ctx = {
+		cwd: directory,
+		sessionManager: {
+			getBranch: () => entries,
+			getSessionId: () => "config-test",
+			getSessionFile: () => join(directory, "session.jsonl"),
+		},
+		ui: {
+			theme: { fg: (_color, text) => text },
+			setStatus() {},
+			notify(message, level) {
+				notices.push({ message, level });
+			},
+		},
+	};
+	const pi = {
+		on(name, handler) {
+			const previous = handlers.get(name);
+			handlers.set(name, async (...args) => {
+				await previous?.(...args);
+				return handler(...args);
+			});
+		},
+		registerTool(tool) {
+			tools.push(tool);
+		},
+		registerMessageRenderer(type, renderer) {
+			renderers.set(type, renderer);
+		},
+		registerCommand() {},
+		appendEntry(customType, data) {
+			entries.push({ type: "custom", customType, data });
+		},
+		events: { emit() {} },
+	};
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	try {
+		process.env.PI_CODING_AGENT_DIR = directory;
+		loadExtension(pi);
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+	}
+	t.after(() => handlers.get("session_shutdown")({}, ctx));
+	return { directory, file, handlers, tools, renderers, notices, entries, ctx };
+}
+
+for (const [label, raw] of [["missing config file", undefined], ["missing concourse key", "{}"]]) {
+	test(`${label} silently leaves Concourse off`, async (t) => {
+		const subject = await configuredExtension(t, raw);
+		await subject.handlers.get("session_start")({}, subject.ctx);
+		assert.deepEqual(subject.tools.map((tool) => tool.name), ["monitor_github_pr"]);
+		assert.equal(subject.renderers.has("concourse_deployment_outcome"), false);
+		assert.deepEqual(subject.notices, []);
+	});
+}
+
+for (const [label, raw, key] of [
+	["leading-dash target", '{"concourse":{"target":"-private-value"}}', "concourse.target"],
+	["relative flyPath", '{"concourse":{"target":"ci","flyPath":"private-value"}}', "concourse.flyPath"],
+	["unknown key", '{"concourse":{"target":"ci","typo":"private-value"}}', "concourse.typo"],
+	["malformed JSON", '{"concourse": private-value}', "JSON"],
+]) {
+	test(`${label} disables Concourse with one warning and keeps GitHub registered`, async (t) => {
+		const subject = await configuredExtension(t, raw);
+		assert.deepEqual(subject.notices, []);
+		await subject.handlers.get("session_start")({}, subject.ctx);
+		await subject.handlers.get("session_start")({}, subject.ctx);
+		assert.deepEqual(subject.tools.map((tool) => tool.name), ["monitor_github_pr"]);
+		assert.equal(subject.renderers.has("concourse_deployment_outcome"), false);
+		assert.equal(subject.notices.length, 1);
+		assert.equal(subject.notices[0].level, "warning");
+		assert.ok(subject.notices[0].message.includes(subject.file));
+		assert.ok(subject.notices[0].message.includes(key));
+		assert.doesNotMatch(subject.notices[0].message, /private-value/);
+	});
+}
+
+test("Concourse rejects invalid config shapes, names, and executable paths", async (t) => {
+	const invalid = [
+		[null, "must be an object"],
+		[[], "must be an object"],
+		[{ concourse: null }, "concourse"],
+		[{ concourse: [] }, "concourse"],
+		[{ concourse: {} }, "concourse.target"],
+		[{ concourse: { target: 1 } }, "concourse.target"],
+		[{ concourse: { target: "a".repeat(129) } }, "concourse.target"],
+		[{ concourse: { target: " ci" } }, "concourse.target"],
+		[{ concourse: { target: "ci/path" } }, "concourse.target"],
+		[{ concourse: { target: "ci", team: "-team" } }, "concourse.team"],
+		[{ concourse: { target: "ci", team: null } }, "concourse.team"],
+		[{ concourse: { target: "ci", resource: "" } }, "concourse.resource"],
+		[{ concourse: { target: "ci", resource: "a".repeat(129) } }, "concourse.resource"],
+		[{ concourse: { target: "ci", flyPath: null } }, "concourse.flyPath"],
+		[{ concourse: { target: "ci", flyPath: "/fly\n" } }, "concourse.flyPath"],
+		[{ concourse: { target: "ci", flyPath: "/fly\u0085" } }, "concourse.flyPath"],
+		[{ concourse: { target: "ci", flyPath: `/${"é".repeat(256)}` } }, "concourse.flyPath"],
+	];
+	for (const [config, key] of invalid) {
+		const subject = await configuredExtension(t, JSON.stringify(config));
+		await subject.handlers.get("session_start")({}, subject.ctx);
+		assert.deepEqual(subject.tools.map((tool) => tool.name), ["monitor_github_pr"]);
+		assert.equal(subject.notices.length, 1);
+		assert.ok(subject.notices[0].message.includes(key));
+	}
+});
+
+test("Concourse config follows PI_CODING_AGENT_DIR and applies defaults", async (t) => {
+	const subject = await configuredExtension(t, '{"concourse":{"target":"ci"}}');
+	const { loadConcourseConfig } = await import("./adapters/concourse-config.ts");
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	try {
+		process.env.PI_CODING_AGENT_DIR = subject.directory;
+		assert.deepEqual(loadConcourseConfig(), {
+			config: { target: "ci", team: "main", resource: "repo", flyPath: "/usr/local/bin/fly" },
+		});
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+	}
+	assert.deepEqual(subject.tools.map((tool) => tool.name), ["monitor_github_pr", "monitor_concourse_deployment"]);
+	assert.equal(subject.renderers.has("concourse_deployment_outcome"), true);
+	assert.deepEqual(subject.notices, []);
+});
+
+test("Concourse config accepts name and UTF-8 path boundaries", async (t) => {
+	const subject = await configuredExtension(t, JSON.stringify({
+		unrelated: { setting: true },
+		concourse: {
+			target: `c${"i".repeat(62)}`,
+			team: "Team_1.2-prod",
+			resource: "Repo_1.2-main",
+			flyPath: `/${"é".repeat(255)}x`,
+		},
+	}));
+	await subject.handlers.get("session_start")({}, subject.ctx);
+	assert.equal(subject.tools.some((tool) => tool.name === "monitor_concourse_deployment"), true);
+	assert.deepEqual(subject.notices, []);
+});
+
+test("Concourse runs the configured executable, target, team, and resource after loading config once", async (t) => {
+	const subject = await configuredExtension(t, undefined, async (directory) => {
+		const flyPath = join(directory, "configured-fly");
+		const calls = join(directory, "calls.jsonl");
+		const script = [
+			`#!${process.execPath}`,
+			'const fs = require("node:fs");',
+			"const args = process.argv.slice(2);",
+			`fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");`,
+			'const jobs = [{ name: "deploy", inputs: [{ name: "source", resource: "source-code" }] }];',
+			'process.stdout.write(JSON.stringify(args[2] === "jobs" ? jobs : []));',
+		].join("\n");
+		await writeFile(flyPath, script, { mode: 0o700 });
+		return JSON.stringify({ concourse: { target: "build-ci", team: "release", resource: "source-code", flyPath } });
+	});
+	await writeFile(subject.file, "not JSON after extension load");
+	await subject.handlers.get("session_start")({}, subject.ctx);
+	const tool = subject.tools.find((candidate) => candidate.name === "monitor_concourse_deployment");
+	const result = await tool.execute("configured", {
+		pipeline: "my-service-deploy",
+		revision: "a".repeat(40),
+	}, undefined, undefined, subject.ctx);
+	assert.equal(result.details.health, "healthy");
+	assert.deepEqual(subject.notices, []);
+	const { readFile } = await import("node:fs/promises");
+	const calls = (await readFile(join(subject.directory, "calls.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+	assert.deepEqual(calls[0], ["-t", "build-ci", "jobs", "-p", "my-service-deploy", "--team=release", "--json"]);
+	assert.deepEqual(calls[1], [
+		"-t", "build-ci", "curl",
+		`/api/v1/teams/release/pipelines/my-service-deploy/resources/source-code/versions?filter=ref%3A${"a".repeat(40)}`,
+		"--", "--silent", "--show-error",
+	]);
+	const registration = subject.entries.findLast((entry) => entry.customType === "pi-monitors-records")
+		.data.active[0].state.registration;
+	assert.equal(registration.target, "build-ci");
+	assert.equal(registration.team, "release");
+	assert.equal(registration.resource, "source-code");
+});
+
+for (const kind of ["FIFO", "symlink to FIFO"]) {
+	test(`Concourse config rejects a ${kind} promptly and keeps GitHub registered`, async (t) => {
+		const { spawnSync } = await import("node:child_process");
+		const directory = await mkdtemp(join(tmpdir(), "pi-monitors-fifo-"));
+		t.after(() => rm(directory, { recursive: true, force: true }));
+		const fifo = join(directory, "fifo");
+		const created = spawnSync("mkfifo", [fifo], { timeout: 1_000 });
+		if (created.error?.code === "ENOENT") {
+			t.skip("mkfifo is unavailable");
+			return;
+		}
+		assert.ifError(created.error);
+		assert.equal(created.status, 0);
+		// A test-runner timeout cannot interrupt a synchronous FIFO read.
+		const source = `
+			import assert from "node:assert/strict";
+			import { mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
+			import { tmpdir } from "node:os";
+			import { join } from "node:path";
+			${configuredExtension.toString()}
+			const cleanup = [];
+			try {
+				const subject = await configuredExtension({ after: (fn) => cleanup.push(fn) }, undefined, async (directory) => {
+					await ${kind === "FIFO" ? "rename" : "symlink"}(${JSON.stringify(fifo)}, join(directory, "pi-monitors.json"));
+				});
+				await subject.handlers.get("session_start")({}, subject.ctx);
+				await subject.handlers.get("session_start")({}, subject.ctx);
+				assert.deepEqual(subject.tools.map((tool) => tool.name), ["monitor_github_pr"]);
+				assert.equal(subject.notices.length, 1);
+				assert.equal(subject.notices[0].level, "warning");
+				assert.ok(subject.notices[0].message.includes(subject.file));
+				assert.match(subject.notices[0].message, /must be a regular file/);
+			} finally {
+				for (const fn of cleanup.reverse()) await fn();
+			}
+		`;
+		const result = spawnSync(process.execPath, ["--input-type=module", "-e", source], {
+			cwd: new URL("./", import.meta.url),
+			env: { ...process.env, TMPDIR: directory, TMP: directory, TEMP: directory },
+			timeout: 3_000,
+			killSignal: "SIGKILL",
+			encoding: "utf8",
+		});
+		assert.ifError(result.error);
+		assert.equal(result.status, 0, result.stderr);
+	});
+}
+
+test("Concourse config rejects a file just over 64 KiB and keeps GitHub registered", async (t) => {
+	const raw = JSON.stringify({ concourse: { target: "ci" } }).padEnd(64 * 1024 + 1, " ");
+	const subject = await configuredExtension(t, raw);
+	await subject.handlers.get("session_start")({}, subject.ctx);
+	await subject.handlers.get("session_start")({}, subject.ctx);
+	assert.deepEqual(subject.tools.map((tool) => tool.name), ["monitor_github_pr"]);
+	assert.equal(subject.notices.length, 1);
+	assert.equal(subject.notices[0].level, "warning");
+	assert.ok(subject.notices[0].message.includes(subject.file));
+	assert.match(subject.notices[0].message, /must be at most 64 KiB/);
+});
+
+test("Concourse config accepts a regular file of exactly 64 KiB", async (t) => {
+	const raw = JSON.stringify({ concourse: { target: "ci" } }).padEnd(64 * 1024, " ");
+	const subject = await configuredExtension(t, raw);
+	await subject.handlers.get("session_start")({}, subject.ctx);
+	assert.deepEqual(subject.tools.map((tool) => tool.name), ["monitor_github_pr", "monitor_concourse_deployment"]);
+	assert.deepEqual(subject.notices, []);
+});
+
+for (const field of ["target", "team", "resource"]) {
+	test(`Concourse config rejects a 64-character ${field} with one warning`, async (t) => {
+		const raw = JSON.stringify({ concourse: { target: "ci", [field]: "a".repeat(64) } });
+		const subject = await configuredExtension(t, raw);
+		await subject.handlers.get("session_start")({}, subject.ctx);
+		assert.deepEqual(subject.tools.map((tool) => tool.name), ["monitor_github_pr"]);
+		assert.equal(subject.notices.length, 1);
+		assert.equal(subject.notices[0].level, "warning");
+		assert.ok(subject.notices[0].message.includes(subject.file));
+		assert.ok(subject.notices[0].message.includes(`concourse.${field} must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`));
+	});
+}
+
+test("Concourse registers 63-character names and a 128-character pipeline with configured fly arguments", async (t) => {
+	const target = "t".repeat(63);
+	const team = "m".repeat(63);
+	const resource = "r".repeat(63);
+	const pipeline = "p".repeat(128);
+	const revision = "a".repeat(40);
+	const subject = await configuredExtension(t, undefined, async (directory) => {
+		const flyPath = join(directory, "configured-fly");
+		const calls = join(directory, "calls.jsonl");
+		const jobs = [{ name: "deploy", inputs: [{ name: "source", resource }] }];
+		const script = [
+			`#!${process.execPath}`,
+			'const fs = require("node:fs");',
+			"const args = process.argv.slice(2);",
+			`fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");`,
+			`process.stdout.write(JSON.stringify(args[2] === "jobs" ? ${JSON.stringify(jobs)} : []));`,
+		].join("\n");
+		await writeFile(flyPath, script, { mode: 0o700 });
+		return JSON.stringify({ concourse: { target, team, resource, flyPath } });
+	});
+	await subject.handlers.get("session_start")({}, subject.ctx);
+	const tool = subject.tools.find((candidate) => candidate.name === "monitor_concourse_deployment");
+	const result = await tool.execute("name-boundaries", { pipeline, revision }, undefined, undefined, subject.ctx);
+	assert.equal(result.details.health, "healthy");
+	assert.deepEqual(subject.notices, []);
+	const { readFile } = await import("node:fs/promises");
+	const calls = (await readFile(join(subject.directory, "calls.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+	assert.deepEqual(calls[0], ["-t", target, "jobs", "-p", pipeline, `--team=${team}`, "--json"]);
+	assert.deepEqual(calls[1], [
+		"-t", target, "curl",
+		`/api/v1/teams/${team}/pipelines/${pipeline}/resources/${resource}/versions?filter=ref%3A${revision}`,
+		"--", "--silent", "--show-error",
+	]);
+	const record = subject.entries.findLast((entry) => entry.customType === "pi-monitors-records").data.active[0];
+	assert.ok(record.id.length <= 512);
+	assert.equal(record.state.registration.target, target);
+	assert.equal(record.state.registration.team, team);
+	assert.equal(record.state.registration.resource, resource);
+});
+
+test("Concourse warnings replace U+200E and all control and format characters in unknown keys", async (t) => {
+	const key = "typo\u0000\u0085\u061c\u200e\u200f\u202e\u2066\u200b";
+	const raw = JSON.stringify({ concourse: { target: "ci", [key]: "private-value" } });
+	const subject = await configuredExtension(t, raw);
+	await subject.handlers.get("session_start")({}, subject.ctx);
+	assert.deepEqual(subject.tools.map((tool) => tool.name), ["monitor_github_pr"]);
+	assert.equal(subject.notices.length, 1);
+	assert.equal(subject.notices[0].level, "warning");
+	assert.ok(subject.notices[0].message.includes(subject.file));
+	assert.doesNotMatch(subject.notices[0].message, /[\p{Cc}\p{Cf}]/u);
+	assert.ok(subject.notices[0].message.includes(`concourse.typo${"\uFFFD".repeat(8)} is an unknown key`));
+	assert.doesNotMatch(subject.notices[0].message, /private-value/);
+});
+
+test("Concourse config rejects control and format characters in flyPath", async (t) => {
+	for (const character of ["\u0000", "\u0085", "\u061c", "\u200e", "\u200f", "\u202e", "\u2066", "\u200b"]) {
+		const raw = JSON.stringify({ concourse: { target: "ci", flyPath: `/private-value${character}/fly` } });
+		const subject = await configuredExtension(t, raw);
+		await subject.handlers.get("session_start")({}, subject.ctx);
+		assert.deepEqual(subject.tools.map((tool) => tool.name), ["monitor_github_pr"]);
+		assert.equal(subject.notices.length, 1);
+		assert.equal(subject.notices[0].level, "warning");
+		assert.ok(subject.notices[0].message.includes(subject.file));
+		assert.match(subject.notices[0].message, /concourse.flyPath/);
+		assert.doesNotMatch(subject.notices[0].message, /[\p{Cc}\p{Cf}]|private-value/u);
+	}
+});

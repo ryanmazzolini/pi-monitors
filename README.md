@@ -46,6 +46,83 @@ PRs do not depend on the current working directory.
 GitHub feedback is untrusted external data. A notification does not authorize
 edits, commits, pushes, merges, deployments, or follow-up work.
 
+## Concourse deployment monitoring
+
+The optional `monitor_concourse_deployment` tool watches one pipeline and an exact
+40-character Git revision, such as `my-service-deploy` and the revision just
+pushed. Loading the adapter does not start a watch.
+
+Requirements:
+- A `fly` CLI matching the Concourse server's version (tested with 7.10.0),
+  logged in to the configured target and team.
+- A persisted Pi conversation and a pipeline with a Git resource to track.
+
+Log `fly` in once. The target name is what `pi-monitors.json` refers to; `fly`
+stores the server URL and token for it in `~/.flyrc`:
+
+```sh
+/usr/local/bin/fly login -t ci -c https://ci.example.com -n main
+```
+
+A `fly` with a different major version from the server refuses most commands
+with `out of sync with the target`. Compare `<flyPath> --version` with the
+`version` returned by `https://ci.example.com/api/v1/info`. Running
+`<flyPath> -t ci sync` replaces that binary with the server's version.
+
+The adapter always runs the configured `flyPath`, never the `fly` on `PATH`. If
+you have several installs, for example a newer one from Homebrew, set `flyPath`
+to the one that matches your server.
+
+Create `pi-monitors.json` in Pi's agent directory (normally `~/.pi/agent`, or
+`PI_CODING_AGENT_DIR` when set):
+
+```json
+{
+  "concourse": {
+    "target": "ci",
+    "team": "main",
+    "resource": "repo",
+    "flyPath": "/usr/local/bin/fly"
+  }
+}
+```
+
+Only `target` is required; the other values shown are defaults. Target, team, and
+resource must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`: at most 63 characters,
+with no leading hyphen. `flyPath` must be absolute, contain no control
+characters, and be at most 512 UTF-8 bytes. Unknown keys inside `concourse` are rejected.
+
+The config is read once when the extension loads. Run `/reload` or restart Pi
+after changing it. Without the file or `concourse` key, Concourse is silently off.
+Invalid config disables only Concourse and shows one warning at session start;
+GitHub monitoring keeps working. The model supplies only `pipeline` and `revision`,
+never the target, team, resource, or executable. The configured target selects the
+Concourse instance and credentials from `~/.flyrc`.
+
+Use `/monitors` to inspect, refresh, or stop the watch. It polls read-only every
+30 seconds while Pi runs. Resuming or forking the conversation restores the watch;
+leases under the agent directory's `pi-monitors/leases` prevent competing sessions
+from watching the same deployment. A restored registration is discarded if its
+target, team, or resource differs from the current config.
+
+The adapter matches the exact revision and freezes the resource-connected job
+graph. Every terminal job must succeed for success; a failed, errored, or aborted
+matched build reports failure with the first failing build and its log tail.
+Graph changes, connectivity failures, and expired authentication degrade monitor
+health and retry with backoff capped at ten minutes, without waking the model.
+Terminal outcomes use durable notifications, including batches shared with GitHub,
+and the watch stops after acknowledgement.
+
+Limits: one watch per session, 100 pipeline jobs, 500 builds for the exact resource
+version, and ten matching resource versions. Job graphs are bounded to 16 KiB;
+responses to 5 MiB; error output to 512 KiB; log tails to 200 lines and 16 KiB;
+outcome content to 48 KiB. Logs are sanitized and redacted best-effort, not guaranteed
+secret-free. External names, metadata, and logs remain untrusted data.
+
+The adapter never triggers or retries builds, manages VPN connectivity, edits
+pipelines, pushes code, rolls back, or deploys. Outcome messages grant no new
+authority to act.
+
 ## Trusted adapters
 
 Trusted extensions can contribute adapters without importing this package.
