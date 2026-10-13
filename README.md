@@ -108,10 +108,16 @@ target, team, or resource differs from the current config.
 The adapter matches the exact revision and freezes the resource-connected job
 graph. Every terminal job must succeed for success; a failed, errored, or aborted
 matched build reports failure with the first failing build and its log tail.
-Graph changes, connectivity failures, and expired authentication degrade monitor
-health and retry with backoff capped at ten minutes, without waking the model.
 Terminal outcomes use durable notifications, including batches shared with GitHub,
 and the watch stops after acknowledgement.
+
+When checks fail, `/monitors` shows a hint: check your network or VPN, log in,
+sync the `fly` version, configure its target, or install the configured binary.
+Other failures show a generic retry hint or the adapter's validation error.
+The sanitized raw error stays in the `Error:` detail line. The watch checks every
+30 seconds; after a failure, retries back off to at most every 2 minutes.
+After 15 minutes degraded, it sends one agent notice per outage while polling
+continues. The watch never gives up on its own. Stop it in `/monitors`.
 
 Limits: one watch per session, 100 pipeline jobs, 500 builds for the exact resource
 version, and ten matching resource versions. Job graphs are bounded to 16 KiB;
