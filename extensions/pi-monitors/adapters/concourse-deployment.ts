@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import {
 	getAgentDir,
@@ -579,6 +580,7 @@ async function executeFlyBounded(flyPath: string, args: string[], options: FlyEx
 async function readFlyBuildLog(config: ConcourseConfig, build: MatchedBuild, signal: AbortSignal): Promise<BoundedLog> {
 	return new Promise((resolve) => {
 		const child = spawn(config.flyPath, ["-t", config.target, "watch", "-b", String(build.id)], {
+			cwd: homedir(),
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let tail = Buffer.alloc(0);
@@ -983,7 +985,7 @@ export class ConcourseDeploymentMonitorRuntime {
 
 	private async execFly(args: string[], label: string, signal: AbortSignal): Promise<ExecResult> {
 		const result = await this.executeFly(["-t", this.config.target, ...args], {
-			cwd: this.ctx?.cwd,
+			cwd: homedir(),
 			timeout: this.execTimeoutMs,
 			signal,
 		});

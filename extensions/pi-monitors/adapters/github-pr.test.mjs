@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import { createPiMonitorsExtension } from "../index.ts";
 import { MONITOR_BATCH_MESSAGE_TYPE } from "../types.ts";
 import {
@@ -214,6 +219,53 @@ test("stays dormant until monitor_github_pr is called explicitly", async () => {
   assert.equal(f.execCalls.length, 0);
   assert.equal(f.sent.length, 0);
   assert.equal(f.timer.timers.length, 0);
+});
+
+test("real GitHub polling survives deletion of its owning cwd", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "github-cwd-"));
+  const owner = join(directory, "ticket");
+  await mkdir(owner);
+  const script = join(directory, "fake-gh.cjs");
+  const callsFile = join(directory, "calls.jsonl");
+  await writeFile(script, [
+    'const fs = require("node:fs");',
+    "const args = process.argv.slice(2);",
+    `fs.appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ args, cwd: process.cwd() }) + "\\n");`,
+    `const url = ${JSON.stringify(PR_URL)};`,
+    'const value = args[0] === "pr" ? { number: 42, url, title: "Widgets", state: "OPEN" }',
+    '  : args.at(-1).split("?")[0].endsWith("/pulls/42") ? { number: 42, html_url: url, title: "Widgets", state: "open" } : [];',
+    "console.log(JSON.stringify(value));",
+  ].join("\n"));
+  const f = fixture();
+  f.ctx.cwd = owner;
+  // Match Pi's cwd default while replacing gh with a local, real subprocess.
+  f.pi.exec = async (command, args, options) => {
+    assert.equal(command, "gh");
+    const { stdout, stderr } = await promisify(execFile)(process.execPath, [script, ...args], {
+      ...options,
+      cwd: options?.cwd ?? f.ctx.cwd,
+    });
+    return { code: 0, stdout, stderr };
+  };
+  t.after(async () => {
+    await f.handlers.get("session_shutdown")({}, f.ctx);
+    await rm(directory, { recursive: true, force: true });
+  });
+  await start(f);
+  await f.runtime.register(PR_URL, f.ctx, undefined, false);
+  assert.equal(f.runtime.snapshot().active[0].health, "healthy");
+  const initialCalls = (await readFile(callsFile, "utf8")).trim().split("\n").length;
+
+  await rm(owner, { recursive: true });
+  await f.runtime.refresh();
+
+  assert.equal(f.runtime.snapshot().active[0].health, "healthy");
+  const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.ok(calls.length > initialCalls, "the second poll launches real subprocesses");
+  const home = await realpath(homedir());
+  assert.ok(calls.every((call) => call.cwd === home));
+  assert.deepEqual(calls[0].args, ["pr", "view", PR_URL, "--json", "number,url,title,state"]);
+  assert.equal(f.sent.length, 0);
 });
 
 test("registers one exact PR and delivers all three feedback surfaces", async () => {

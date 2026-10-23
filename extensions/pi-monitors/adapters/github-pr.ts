@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 import { keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -973,7 +974,7 @@ export class GithubPrMonitorRuntime implements PiMonitorSession {
 	}
 
 	private async execJson(command: string, args: string[], label: string, signal: AbortSignal): Promise<unknown> {
-		const result = await this.pi.exec(command, args, { timeout: this.execTimeoutMs, signal });
+		const result = await this.pi.exec(command, args, { cwd: homedir(), timeout: this.execTimeoutMs, signal });
 		if (result.code !== 0) throw new Error(`${label} failed: ${cleanLine(result.stderr || result.stdout || `exit code ${result.code}`).slice(0, 500)}`);
 		if (Buffer.byteLength(result.stdout, "utf8") > MAX_RESPONSE_BYTES) throw new FeedbackLimitError(`${label} exceeded the response limit`);
 		try {

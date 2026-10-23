@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -579,6 +580,86 @@ test("default backoff keeps healthy checks at 30s and failed retries at 60s then
 	await settleAsyncWork();
 	assert.equal(subject.timer.scheduled.at(-1).delayMs, 30_000);
 });
+
+for (const removeOwner of [false, true]) {
+	test(`real polling and failure logs work ${removeOwner ? "after the owning cwd is deleted" : "with an existing owning cwd"}`, async (t) => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "concourse-cwd-"));
+		t.after(() => fs.rm(directory, { recursive: true, force: true }));
+		const owner = path.join(directory, "ticket");
+		await fs.mkdir(owner);
+		const flyPath = path.join(directory, "fake-fly");
+		const callsFile = path.join(directory, "calls.jsonl");
+		const failureFile = path.join(directory, "failed");
+		const config = { ...CONFIG, flyPath };
+		const script = [
+			`#!${process.execPath}`,
+			'const fs = require("node:fs");',
+			"const args = process.argv.slice(2);",
+			`fs.appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ args, cwd: process.cwd() }) + "\\n");`,
+			`const failed = fs.existsSync(${JSON.stringify(failureFile)});`,
+			`const build = ${JSON.stringify(build(201, "deploy", "failed"))};`,
+			'if (args[2] === "watch") { console.log("failure log from fake fly"); process.exit(0); }',
+			'let response;',
+			'if (args[2] === "jobs") response = [{ name: "deploy", inputs: [{ name: "repo", resource: "repo" }] }];',
+			`else if (args[3].includes("/versions?")) response = failed ? [{ id: 9001, version: { ref: ${JSON.stringify(REVISION)} } }] : [];`,
+			'else if (args[3].endsWith("/input_to")) response = [build];',
+			`else if (args[3].endsWith("/resources")) response = { inputs: [{ name: "repo", version: { ref: ${JSON.stringify(REVISION)} } }] };`,
+			'else throw new Error("Unexpected fly arguments: " + JSON.stringify(args));',
+			"console.log(JSON.stringify(response));",
+		].join("\n");
+		await fs.writeFile(flyPath, script, { mode: 0o700 });
+
+		// Only this disposable child inherits the ticket cwd; the test runner and Pi never enter it.
+		const source = `
+			import assert from "node:assert/strict";
+			import fs from "node:fs/promises";
+			import path from "node:path";
+			import { createPiMonitorsExtension } from ${JSON.stringify(new URL("../index.ts", import.meta.url).href)};
+			import { createConcourseDeploymentMonitorAdapter } from ${JSON.stringify(new URL("./concourse-deployment.ts", import.meta.url).href)};
+			const CONFIG = ${JSON.stringify(config)};
+			const PIPELINE = ${JSON.stringify(PIPELINE)};
+			const REVISION = ${JSON.stringify(REVISION)};
+			${jobs.toString()}
+			${okJson.toString()}
+			${fakeSchedule.toString()}
+			${fakeLease.toString()}
+			${fixture.toString()}
+			${outcomePacket.toString()}
+			const subject = fixture({ runtimeOptions: { executeFly: undefined, readBuildLog: undefined } });
+			subject.ctx.cwd = ${JSON.stringify(owner)};
+			try {
+				await subject.handlers.get("session_start")({}, subject.ctx);
+				await subject.runtime.register(PIPELINE, REVISION, subject.ctx);
+				assert.equal(subject.runtime.snapshot().active[0].health, "healthy");
+				assert.equal(subject.sent.length, 0);
+				if (${removeOwner}) await fs.rm(${JSON.stringify(owner)}, { recursive: true });
+				await fs.writeFile(${JSON.stringify(failureFile)}, "failed");
+				await subject.host.refresh();
+				const packet = outcomePacket(subject);
+				assert.equal(packet.outcome, "failed");
+				assert.equal(packet.revision, REVISION);
+				assert.equal(packet.firstFailure.id, 201);
+				assert.equal(packet.firstFailure.logTail, "failure log from fake fly");
+			} finally {
+				await subject.handlers.get("session_shutdown")({}, subject.ctx);
+			}
+		`;
+		const result = spawnSync(process.execPath, ["--input-type=module", "-e", source], {
+			cwd: owner,
+			timeout: 10_000,
+			killSignal: "SIGKILL",
+			encoding: "utf8",
+		});
+		assert.ifError(result.error);
+		assert.equal(result.status, 0, result.stderr);
+		const calls = (await fs.readFile(callsFile, "utf8")).trim().split("\n").map(JSON.parse);
+		assert.ok(calls.length > 2, "a second poll launches after the owning cwd may have been deleted");
+		const home = await fs.realpath(os.homedir());
+		assert.ok(calls.every((call) => call.cwd === home));
+		assert.deepEqual(calls[0].args, ["-t", CONFIG.target, "jobs", "-p", PIPELINE, "--team=main", "--json"]);
+		assert.deepEqual(calls.at(-1).args, ["-t", CONFIG.target, "watch", "-b", "201"]);
+	});
+}
 
 test("derives repo-connected terminal jobs from passed constraints", () => {
 	assert.deepEqual(deriveJobGraph([
