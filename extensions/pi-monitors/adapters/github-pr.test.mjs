@@ -143,6 +143,7 @@ function fixture({
   };
   const ctx = {
     cwd: "/unrelated/directory",
+    isIdle: () => true,
     mode: "tui",
     sessionManager: {
       getBranch: () => entries,

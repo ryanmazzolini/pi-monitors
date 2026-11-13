@@ -102,6 +102,7 @@ test("binds adapters once and forwards Pi lifecycle events in registration order
   const statuses = [];
   const ctx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => [] },
     ui: {
       theme: { fg: (_color, text) => text },
@@ -135,6 +136,8 @@ test("binds adapters once and forwards Pi lifecycle events in registration order
     "message_end",
     "agent_start",
     "agent_settled",
+    "session_compact",
+    "session_compact_failed",
     "session_shutdown",
   ]);
 });
@@ -150,6 +153,7 @@ test("discovers external adapters before starting their session", async () => {
   });
   const ctx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => [] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -178,6 +182,7 @@ test("validates discovered adapters and closes registration after startup", asyn
   });
   const ctx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => [] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -208,6 +213,7 @@ test("reserves discovered adapter IDs during binding", async () => {
   });
   const ctx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => [] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -245,6 +251,7 @@ test("disposes a discovered session when subscription fails", async () => {
   });
   const ctx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => [] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -278,6 +285,7 @@ test("visits every adapter before reporting lifecycle failures", async () => {
   ]);
   const ctx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => [] },
     ui: {
       theme: { fg: (_color, text) => text },
@@ -331,6 +339,7 @@ test("shutdown stops host schedulers even when another cleanup fails", async () 
   subject.runtime.addCleanup(() => { throw new Error("overlay cleanup failed"); });
   const ctx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => [] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -372,6 +381,7 @@ test("filesystem observation starts only after every adapter session initializes
   const unsubscribe = subject.pi.events.on(FILES_CHANGED_EVENT, (value) => received.push(value));
   const ctx = {
     cwd: directory,
+    isIdle: () => true,
     sessionManager: { getBranch: () => [] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -428,6 +438,7 @@ test("failed adapter startup leaves filesystem observation dormant", async () =>
   const unsubscribe = subject.pi.events.on(FILES_CHANGED_EVENT, (value) => received.push(value));
   const ctx = {
     cwd: directory,
+    isIdle: () => true,
     sessionManager: { getBranch: () => [] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -477,6 +488,7 @@ test("filesystem events wake a monitor's authoritative check", async () => {
   }]);
   const ctx = {
     cwd: directory,
+    isIdle: () => true,
     sessionManager: { getBranch: () => [] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -521,6 +533,7 @@ test("filesystem wakeups notify an event-only subscriber without creating a moni
   const unsubscribe = subject.pi.events.on(FILES_CHANGED_EVENT, (value) => received.push(value));
   const ctx = {
     cwd: directory,
+    isIdle: () => true,
     sessionManager: { getBranch: () => [] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -569,6 +582,7 @@ test("active stores persist bounded adapter state and roll back failed writes", 
   const subject = fixture([storedAdapter]);
   const ctx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => subject.entries },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -603,6 +617,7 @@ test("purges durable records that the current adapter version cannot load", asyn
   }]);
   const firstCtx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => first.entries },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -623,6 +638,7 @@ test("purges durable records that the current adapter version cannot load", asyn
   }]);
   const restoredCtx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => [...first.entries, ...restored.entries] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -649,6 +665,7 @@ test("delivery persists a receipt before sending and deduplicates acknowledgemen
   }]);
   const ctx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => subject.entries },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -717,6 +734,7 @@ test("batches pending monitor notifications into one follow-up and waits for it 
   }]);
   const ctx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => subject.entries },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -760,6 +778,50 @@ test("batches pending monitor notifications into one follow-up and waits for it 
   assert.equal(subject.sent[1][0].content, "third");
 });
 
+for (const endEvent of ["session_compact", "session_compact_failed"]) {
+  test(`holds notifications during compaction and delivers after ${endEvent}`, async () => {
+    let store;
+    let delivery;
+    const subject = fixture([{
+      id: "delivery",
+      bind(_pi, services) {
+        store = services.createActiveStore({ version: 1, decodeState: (value) => value });
+        delivery = services.createDelivery();
+        return {
+          async startSession() {}, async rebindBranch() {}, async messageEnded() {}, async dispose() {},
+          snapshot: () => ({ active: [], recent: [] }), subscribe: () => () => undefined,
+          async refresh() { return false; }, async stop() { return false; },
+        };
+      },
+    }]);
+    let compacting = false;
+    const ctx = {
+      cwd: "/work",
+      isIdle: () => !compacting,
+      sessionManager: { getBranch: () => subject.entries },
+      ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
+    };
+    await subject.handlers.get("session_start")({}, ctx);
+    store.save("delivery:one", { id: 1 });
+
+    compacting = true;
+    delivery.deliver("delivery:one", {
+      fingerprint: "a".repeat(64), customType: "test_event", content: "merged", details: {},
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(subject.sent.length, 0);
+
+    // Pi awaits the end event while it still reports compaction, then clears it.
+    await subject.handlers.get(endEvent)({}, ctx);
+    compacting = false;
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(subject.sent.length, 1);
+    assert.equal(subject.sent[0][0].content, "merged");
+  });
+}
+
 test("branch navigation discards notifications queued by the previous branch", async () => {
   let store;
   let delivery;
@@ -777,6 +839,7 @@ test("branch navigation discards notifications queued by the previous branch", a
   }]);
   const ctx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => subject.entries },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -808,6 +871,7 @@ test("malformed reserved batches are not forwarded to adapters", async () => {
   const subject = fixture([adapter("alpha", calls)]);
   const ctx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => [] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -840,6 +904,7 @@ test("restores every durable receipt from a batched notification", async () => {
   }]);
   const firstCtx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => first.entries },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -873,6 +938,7 @@ test("restores every durable receipt from a batched notification", async () => {
   }]);
   const restoredCtx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => [...durableBranch, ...restored.entries] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -914,6 +980,7 @@ test("aggregates adapter views and routes refresh and stop by monitor ID", async
   const statuses = [];
   const ctx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => [] },
     ui: {
       theme: { fg: (_color, text) => text },
@@ -956,6 +1023,7 @@ test("persists completed records, restores them, and keeps dismissals branch-loc
   const first = fixture([adapter("alpha", calls, { snapshot: { active: [], recent: [completed] } })]);
   const firstCtx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => first.entries },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -967,6 +1035,7 @@ test("persists completed records, restores them, and keeps dismissals branch-loc
   const second = fixture([adapter("alpha", calls)]);
   const secondCtx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => [...first.entries, ...second.entries] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -986,6 +1055,7 @@ test("persists completed records, restores them, and keeps dismissals branch-loc
   const third = fixture([adapter("alpha", calls, { snapshot: { active: [], recent: [completed] } })]);
   const thirdCtx = {
     cwd: "/work",
+    isIdle: () => true,
     sessionManager: { getBranch: () => [...first.entries, ...second.entries, ...third.entries] },
     ui: { theme: { fg: (_color, text) => text }, setStatus() {} },
   };
@@ -1007,6 +1077,7 @@ async function configuredExtension(t, raw, prepare) {
 	const entries = [];
 	const ctx = {
 		cwd: directory,
+		isIdle: () => true,
 		sessionManager: {
 			getBranch: () => entries,
 			getSessionId: () => "config-test",

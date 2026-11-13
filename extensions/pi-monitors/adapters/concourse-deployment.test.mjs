@@ -184,6 +184,7 @@ function fixture({
 	};
 	const ctx = {
 		cwd: "/repo",
+		isIdle: () => true,
 		sessionManager: {
 			getSessionId: () => sessionId,
 			getSessionFile: () => `/sessions/${sessionId}.jsonl`,

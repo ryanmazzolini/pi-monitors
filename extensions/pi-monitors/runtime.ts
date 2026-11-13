@@ -162,6 +162,8 @@ export class PiMonitorsRuntime {
 		pi.on("message_end", async (event) => this.messageEnded(event.message));
 		pi.on("agent_start", async () => { this.agentActive = true; });
 		pi.on("agent_settled", async () => this.agentSettled());
+		pi.on("session_compact", async () => this.compactionEnded());
+		pi.on("session_compact_failed", async () => this.compactionEnded());
 		pi.on("session_shutdown", async () => this.dispose());
 	}
 
@@ -327,6 +329,14 @@ export class PiMonitorsRuntime {
 		}
 		this.deliveryInFlight = [];
 		this.scheduleDeliveryFlush();
+	}
+
+	/**
+	 * Pi fires these events before it clears its compaction state, so wait a macrotask before
+	 * flushing. Otherwise the flush still sees a busy session and nothing retries it.
+	 */
+	compactionEnded(): void {
+		setImmediate(() => this.scheduleDeliveryFlush());
 	}
 
 	async dispose(): Promise<void> {
@@ -518,6 +528,9 @@ export class PiMonitorsRuntime {
 
 	private flushDeliveries(): void {
 		if (this.deliveryInFlight.length > 0 || this.queuedDeliveries.size === 0) return;
+		// agentActive only tracks agent runs. isIdle() also covers compaction, where a
+		// triggerTurn message would start a run that races the compaction.
+		if (this.context && !this.context.isIdle()) return;
 		const now = Date.now();
 		if (now - this.automaticTurnWindowStarted >= AUTOMATIC_TURN_WINDOW_MS) {
 			this.automaticTurnWindowStarted = now;
